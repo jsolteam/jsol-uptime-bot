@@ -31,3 +31,9 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+/data/
+*.db
+*.db-shm
+*.db-wal
+configs/config.yaml
+.cache/
