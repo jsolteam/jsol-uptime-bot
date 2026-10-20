@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -34,16 +37,44 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	token := strings.TrimSpace(os.Getenv(cfg.Agent.TokenEnv))
-	agentServer := &http.Server{Addr: cfg.Agent.Listen, Handler: agent.Handler(token), ReadHeaderTimeout: 3 * time.Second}
+	listener, err := net.Listen("tcp", cfg.Agent.Listen)
+	if err != nil {
+		slog.Error("не удалось открыть порт агента", "error", err)
+		os.Exit(1)
+	}
+	if cfg.Agent.TLSCertFile != "" {
+		if _, err = tls.LoadX509KeyPair(cfg.Agent.TLSCertFile, cfg.Agent.TLSKeyFile); err != nil {
+			slog.Error("сертификат TLS агента", "error", err)
+			os.Exit(1)
+		}
+	}
+	var nodeStatus atomic.Value
+	var leaderActive atomic.Bool
+	var pollingActive atomic.Bool
+	var pollingBlocked atomic.Bool
+	nodeStatus.Store(agent.NodeStatus{NodeID: cfg.Node.ID, Priority: cfg.Node.Priority})
+	agentServer := &http.Server{Addr: cfg.Agent.Listen, Handler: agent.Handler(token, func() agent.NodeStatus {
+		status := nodeStatus.Load().(agent.NodeStatus)
+		status.Polling = pollingActive.Load()
+		return status
+	}), ReadHeaderTimeout: 3 * time.Second}
 	go func() {
-		if e := agentServer.ListenAndServe(); e != nil && !errors.Is(e, http.ErrServerClosed) {
+		var e error
+		if cfg.Agent.TLSCertFile != "" {
+			e = agentServer.ServeTLS(listener, cfg.Agent.TLSCertFile, cfg.Agent.TLSKeyFile)
+		} else {
+			e = agentServer.Serve(listener)
+		}
+		if e != nil && !errors.Is(e, http.ErrServerClosed) {
 			slog.Error("агент", "error", e)
 		}
 	}()
 	if strings.TrimSpace(os.Getenv(cfg.Telegram.TokenEnv)) == "" {
 		slog.Info("локальный агент запущен", "node", cfg.Node.ID)
 		<-ctx.Done()
-		_ = agentServer.Shutdown(context.Background())
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = agentServer.Shutdown(shutdownCtx)
 		return
 	}
 	db, e := storage.Open(cfg.Storage.SQLitePath)
@@ -70,84 +101,123 @@ func main() {
 		slog.Error("Telegram", "error", e)
 		os.Exit(1)
 	}
-	redisURL := strings.TrimSpace(os.Getenv(cfg.Coordination.RedisURLEnv))
-	if cfg.Coordination.RedisURLEnv == "" {
-		redisURL = strings.TrimSpace(os.Getenv("REDIS_URL"))
-	}
-	if redisURL == "" {
-		slog.Error("для координатора лидера задайте coordination.redis_url_env и REDIS_URL")
-		os.Exit(1)
-	}
-	lease, e := cluster.New(redisURL, "jsol-uptime:leader", cfg.Node.ID, cfg.Node.Priority, time.Duration(cfg.Coordination.Lease), time.Duration(cfg.Coordination.Heartbeat))
-	if e != nil {
-		slog.Error("Redis coordinator", "error", e)
-		os.Exit(1)
-	}
-	defer lease.Close()
+	elector := cluster.New(cfg, token)
 
 	tick := time.NewTicker(time.Duration(cfg.Coordination.Heartbeat))
 	defer tick.Stop()
 	var leaderCancel context.CancelFunc
 	var leader bool
+	pollingFailure := make(chan error, 1)
+	internetFailures, internetSuccesses := 0, 0
+	telegramFailures, telegramSuccesses := 0, 0
+	telegramSuppressedUntil := time.Time{}
 	mon := monitor.New(cfg, db)
-	mon.OnEvent = bot.Notify
+	mon.SetLocalStatus(func() agent.NodeStatus { return nodeStatus.Load().(agent.NodeStatus) })
+	mon.OnEvent = func(message string) {
+		if leaderActive.Load() {
+			bot.Notify(message)
+		}
+	}
+	go mon.Run(ctx, nil)
+	readinessCtx, readinessCancel := context.WithTimeout(ctx, 2*time.Duration(cfg.Monitoring.Timeout))
+	nodeStatus.Store(cluster.CheckReadiness(readinessCtx, cfg))
+	readinessCancel()
 	for {
 		select {
 		case <-ctx.Done():
 			if leaderCancel != nil {
 				leaderCancel()
 			}
-			rctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			if leader {
-				_ = lease.Release(rctx)
-			}
+			leaderActive.Store(false)
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = agentServer.Shutdown(shutdownCtx)
 			cancel()
-			_ = agentServer.Shutdown(context.Background())
 			return
+		case pollingErr := <-pollingFailure:
+			if leader && leaderCancel != nil {
+				leaderCancel()
+				leaderCancel = nil
+				leader = false
+				leaderActive.Store(false)
+				telegramSuppressedUntil = time.Now().Add(3 * time.Duration(cfg.Coordination.Heartbeat))
+				status := nodeStatus.Load().(agent.NodeStatus)
+				status.Telegram = false
+				status.Ready = false
+				status.CheckedAt = time.Now().UTC()
+				nodeStatus.Store(status)
+				slog.Warn("Telegram polling недоступен или занят; роль ведущего уступлена", "error", pollingErr)
+				_ = db.Event(ctx, "", "leader", "Узел уступил роль Telegram-ведущего: polling недоступен или занят")
+			}
 		case <-tick.C:
-			cctx, cancel := context.WithTimeout(ctx, time.Duration(cfg.Monitoring.Timeout))
-			if err = lease.Register(cctx); err != nil {
-				slog.Warn("не удалось обновить регистрацию узла", "error", err)
-				if leader {
-					leaderCancel()
-					leaderCancel = nil
-					leader = false
-					slog.Warn("мониторинг остановлен: потеряна связь с координатором")
-					bot.Notify("Мониторинг остановлен: связь с координатором потеряна")
-				}
-				cancel()
-				continue
+			if !telegramSuppressedUntil.IsZero() && !time.Now().Before(telegramSuppressedUntil) {
+				pollingBlocked.Store(false)
 			}
-			if leader {
-				err = lease.Renew(cctx)
-				if err != nil {
-					leaderCancel()
-					leaderCancel = nil
-					leader = false
-					slog.Warn("лидерская аренда потеряна", "error", err)
-					_ = lease.Release(cctx)
-					_ = db.Event(cctx, "", "leader", "Узел уступил роль ведущего: "+cfg.Node.ID)
-					bot.Notify("Ведущий узел переключается")
-				}
-			} else {
-				var acquired bool
-				acquired, err = lease.Acquire(cctx)
-				if err == nil && acquired {
-					lctx, lcancel := context.WithCancel(ctx)
-					leaderCancel = lcancel
-					leader = true
-					slog.Info("узел стал ведущим", "node", cfg.Node.ID)
-					_ = db.Event(cctx, "", "leader", "Узел стал ведущим: "+cfg.Node.ID)
-					bot.Notify("Ведущий узел: " + cfg.Node.ID)
-					go mon.Run(lctx, nil)
-					go bot.Run(lctx)
-					go bot.RunDailyReports(lctx, lease.ClaimOnce)
-				}
+			probeCtx, cancelProbe := context.WithTimeout(ctx, 2*time.Duration(cfg.Monitoring.Timeout))
+			status := cluster.CheckReadiness(probeCtx, cfg)
+			cancelProbe()
+			previous := nodeStatus.Load().(agent.NodeStatus)
+			suppressed := time.Now().Before(telegramSuppressedUntil)
+			if suppressed {
+				status.Telegram = false
 			}
-			cancel()
-			if err != nil {
-				slog.Warn("координатор недоступен", "error", err)
+			status.Internet = stableSignal(status.Internet, previous.Internet, &internetFailures, &internetSuccesses, cfg.Monitoring.FailureThreshold, cfg.Monitoring.RecoveryThreshold)
+			status.Telegram = stableSignal(status.Telegram, previous.Telegram, &telegramFailures, &telegramSuccesses, cfg.Monitoring.FailureThreshold, cfg.Monitoring.RecoveryThreshold)
+			if suppressed {
+				telegramFailures = cfg.Monitoring.FailureThreshold
+				telegramSuccesses = 0
+				status.Telegram = false
+			}
+			status.Ready = status.Internet && status.Telegram
+			status.Polling = pollingActive.Load()
+			nodeStatus.Store(status)
+			electionCtx, cancelElection := context.WithTimeout(ctx, time.Duration(cfg.Monitoring.Timeout))
+			leaderID, shouldLead, electionErr := elector.Leader(electionCtx, status)
+			cancelElection()
+			if electionErr != nil {
+				slog.Warn("ошибка проверки узлов кластера", "error", electionErr)
+			}
+			if leader && !shouldLead {
+				leaderCancel()
+				leaderCancel = nil
+				leader = false
+				leaderActive.Store(false)
+				slog.Info("узел уступил роль ведущего", "node", cfg.Node.ID, "leader", leaderID)
+				_ = db.Event(ctx, "", "leader", "Узел уступил роль ведущего: "+cfg.Node.ID+"; новый кандидат: "+leaderID)
+			}
+			if !leader && shouldLead && !pollingActive.Load() && !pollingBlocked.Load() {
+				lctx, lcancel := context.WithCancel(ctx)
+				leaderCancel = lcancel
+				leader = true
+				leaderActive.Store(true)
+				slog.Info("узел выбран ведущим", "node", cfg.Node.ID)
+				_ = db.Event(ctx, "", "leader", "Узел стал ведущим: "+cfg.Node.ID)
+				bot.Notify("Ведущий узел: " + cfg.Node.ID)
+				pollingActive.Store(true)
+				go func() {
+					defer pollingActive.Store(false)
+					if err := bot.Run(lctx); err != nil {
+						pollingBlocked.Store(true)
+						select {
+						case pollingFailure <- err:
+						default:
+						}
+					}
+				}()
+				go bot.RunDailyReports(lctx, func(ctx context.Context, date string) (bool, error) {
+					return db.ClaimOnce(ctx, "daily-report:"+date)
+				})
 			}
 		}
 	}
+}
+
+func stableSignal(current, previous bool, failures, successes *int, failureThreshold, recoveryThreshold int) bool {
+	if current {
+		*failures = 0
+		*successes++
+		return previous || *successes >= recoveryThreshold
+	}
+	*successes = 0
+	*failures++
+	return previous && *failures < failureThreshold
 }

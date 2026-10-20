@@ -19,10 +19,10 @@ type Server struct {
 	AgentURL          string
 }
 type Sample struct {
-	ServerID, Status, Internet, AgentStatus, Error string
-	CPU, RAMUsed, RAMTotal, DiskUsed, DiskTotal    float64
-	Uptime                                         uint64
-	CheckedAt                                      time.Time
+	ServerID, Status, Internet, AgentStatus, PingStatus, Error string
+	CPU, RAMUsed, RAMTotal, DiskUsed, DiskTotal                float64
+	Uptime                                                     uint64
+	CheckedAt                                                  time.Time
 }
 
 func Open(path string) (*Store, error) {
@@ -31,12 +31,16 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	schema := `CREATE TABLE IF NOT EXISTS servers(id TEXT PRIMARY KEY,name TEXT NOT NULL,address TEXT NOT NULL,priority INTEGER NOT NULL,agent_url TEXT NOT NULL); CREATE TABLE IF NOT EXISTS samples(id INTEGER PRIMARY KEY,server_id TEXT NOT NULL,checked_at DATETIME NOT NULL,status TEXT NOT NULL,internet TEXT NOT NULL,agent_status TEXT NOT NULL,cpu REAL NOT NULL,ram_used REAL NOT NULL,ram_total REAL NOT NULL,disk_used REAL NOT NULL,disk_total REAL NOT NULL,error TEXT NOT NULL,uptime INTEGER NOT NULL DEFAULT 0); CREATE INDEX IF NOT EXISTS samples_server_time ON samples(server_id,checked_at DESC); CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,occurred_at DATETIME NOT NULL,server_id TEXT NOT NULL,kind TEXT NOT NULL,message TEXT NOT NULL); CREATE INDEX IF NOT EXISTS events_time ON events(occurred_at DESC); CREATE TABLE IF NOT EXISTS users(user_id INTEGER PRIMARY KEY,username TEXT NOT NULL DEFAULT '',role TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1); CREATE TABLE IF NOT EXISTS invitations(username TEXT PRIMARY KEY,invited_by INTEGER NOT NULL,created_at DATETIME NOT NULL); CREATE TABLE IF NOT EXISTS service_state(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at DATETIME NOT NULL);`
+	schema := `CREATE TABLE IF NOT EXISTS servers(id TEXT PRIMARY KEY,name TEXT NOT NULL,address TEXT NOT NULL,priority INTEGER NOT NULL,agent_url TEXT NOT NULL); CREATE TABLE IF NOT EXISTS samples(id INTEGER PRIMARY KEY,server_id TEXT NOT NULL,checked_at DATETIME NOT NULL,status TEXT NOT NULL,internet TEXT NOT NULL,agent_status TEXT NOT NULL,ping_status TEXT NOT NULL DEFAULT 'UNKNOWN',cpu REAL NOT NULL,ram_used REAL NOT NULL,ram_total REAL NOT NULL,disk_used REAL NOT NULL,disk_total REAL NOT NULL,error TEXT NOT NULL,uptime INTEGER NOT NULL DEFAULT 0); CREATE INDEX IF NOT EXISTS samples_server_time ON samples(server_id,checked_at DESC); CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,occurred_at DATETIME NOT NULL,server_id TEXT NOT NULL,kind TEXT NOT NULL,message TEXT NOT NULL); CREATE INDEX IF NOT EXISTS events_time ON events(occurred_at DESC); CREATE TABLE IF NOT EXISTS users(user_id INTEGER PRIMARY KEY,username TEXT NOT NULL DEFAULT '',role TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1); CREATE TABLE IF NOT EXISTS invitations(username TEXT PRIMARY KEY,invited_by INTEGER NOT NULL,created_at DATETIME NOT NULL); CREATE TABLE IF NOT EXISTS service_state(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at DATETIME NOT NULL);`
 	if _, err = db.Exec(schema); err != nil {
 		db.Close()
 		return nil, err
 	}
 	if _, err = db.Exec(`ALTER TABLE samples ADD COLUMN uptime INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		db.Close()
+		return nil, err
+	}
+	if _, err = db.Exec(`ALTER TABLE samples ADD COLUMN ping_status TEXT NOT NULL DEFAULT 'UNKNOWN'`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 		db.Close()
 		return nil, err
 	}
@@ -56,11 +60,11 @@ func (s *Store) SyncServers(ctx context.Context, servers []Server) error {
 	return tx.Commit()
 }
 func (s *Store) Save(ctx context.Context, m Sample) error {
-	_, err := s.DB.ExecContext(ctx, `INSERT INTO samples(server_id,checked_at,status,internet,agent_status,cpu,ram_used,ram_total,disk_used,disk_total,error,uptime) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, m.ServerID, m.CheckedAt.UTC(), m.Status, m.Internet, m.AgentStatus, m.CPU, m.RAMUsed, m.RAMTotal, m.DiskUsed, m.DiskTotal, m.Error, m.Uptime)
+	_, err := s.DB.ExecContext(ctx, `INSERT INTO samples(server_id,checked_at,status,internet,agent_status,ping_status,cpu,ram_used,ram_total,disk_used,disk_total,error,uptime) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, m.ServerID, m.CheckedAt.UTC(), m.Status, m.Internet, m.AgentStatus, m.PingStatus, m.CPU, m.RAMUsed, m.RAMTotal, m.DiskUsed, m.DiskTotal, m.Error, m.Uptime)
 	return err
 }
 func (s *Store) Samples(ctx context.Context, serverID string, since time.Time, limit int) ([]Sample, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT server_id,status,internet,agent_status,cpu,ram_used,ram_total,disk_used,disk_total,checked_at,error,uptime FROM samples WHERE server_id=? AND checked_at>=? ORDER BY checked_at`, serverID, since.UTC())
+	rows, err := s.DB.QueryContext(ctx, `SELECT server_id,status,internet,agent_status,ping_status,cpu,ram_used,ram_total,disk_used,disk_total,checked_at,error,uptime FROM samples WHERE server_id=? AND checked_at>=? ORDER BY checked_at`, serverID, since.UTC())
 	if err != nil {
 		return nil, err
 	}
@@ -68,7 +72,7 @@ func (s *Store) Samples(ctx context.Context, serverID string, since time.Time, l
 	var result []Sample
 	for rows.Next() {
 		var m Sample
-		if err := rows.Scan(&m.ServerID, &m.Status, &m.Internet, &m.AgentStatus, &m.CPU, &m.RAMUsed, &m.RAMTotal, &m.DiskUsed, &m.DiskTotal, &m.CheckedAt, &m.Error, &m.Uptime); err != nil {
+		if err := rows.Scan(&m.ServerID, &m.Status, &m.Internet, &m.AgentStatus, &m.PingStatus, &m.CPU, &m.RAMUsed, &m.RAMTotal, &m.DiskUsed, &m.DiskTotal, &m.CheckedAt, &m.Error, &m.Uptime); err != nil {
 			return nil, err
 		}
 		result = append(result, m)
@@ -89,6 +93,14 @@ func (s *Store) Samples(ctx context.Context, serverID string, since time.Time, l
 func (s *Store) Event(ctx context.Context, server, kind, msg string) error {
 	_, err := s.DB.ExecContext(ctx, `INSERT INTO events(occurred_at,server_id,kind,message) VALUES(?,?,?,?)`, time.Now().UTC(), server, kind, msg)
 	return err
+}
+func (s *Store) ClaimOnce(ctx context.Context, key string) (bool, error) {
+	result, err := s.DB.ExecContext(ctx, `INSERT INTO service_state(key,value,updated_at) VALUES(?,'sent',?) ON CONFLICT(key) DO NOTHING`, key, time.Now().UTC())
+	if err != nil {
+		return false, err
+	}
+	count, err := result.RowsAffected()
+	return count == 1, err
 }
 func (s *Store) Prune(ctx context.Context, days int) error {
 	_, err := s.DB.ExecContext(ctx, `DELETE FROM samples WHERE checked_at < ?`, time.Now().AddDate(0, 0, -days))

@@ -2,8 +2,10 @@ package telegram
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,6 +19,9 @@ import (
 
 type Bot struct {
 	api              *tgbotapi.BotAPI
+	token            string
+	client           *http.Client
+	apiMu            sync.RWMutex
 	cfg              config.Config
 	store            *storage.Store
 	notifyMu         sync.Mutex
@@ -27,11 +32,31 @@ type Bot struct {
 }
 
 func New(token string, c config.Config, s *storage.Store) (*Bot, error) {
-	a, err := tgbotapi.NewBotAPI(token)
-	if err != nil {
-		return nil, err
+	if strings.TrimSpace(token) == "" {
+		return nil, fmt.Errorf("пустой токен Telegram")
 	}
-	return &Bot{api: a, cfg: c, store: s, notifyLast: map[string]time.Time{}}, nil
+	client := &http.Client{Timeout: time.Duration(c.Monitoring.Timeout) + 2*time.Second}
+	return &Bot{token: token, client: client, cfg: c, store: s, notifyLast: map[string]time.Time{}}, nil
+}
+
+func (b *Bot) apiClient() *tgbotapi.BotAPI {
+	b.apiMu.RLock()
+	defer b.apiMu.RUnlock()
+	return b.api
+}
+
+func (b *Bot) ensureAPI() error {
+	if b.apiClient() != nil {
+		return nil
+	}
+	api, err := tgbotapi.NewBotAPIWithClient(b.token, tgbotapi.APIEndpoint, b.client)
+	if err != nil {
+		return err
+	}
+	b.apiMu.Lock()
+	b.api = api
+	b.apiMu.Unlock()
+	return nil
 }
 func (b *Bot) IsAdmin(id int64) bool {
 	for _, v := range b.cfg.Admins {
@@ -48,28 +73,49 @@ func (b *Bot) allowed(ctx context.Context, id int64) bool {
 	ok, err := b.store.Allowed(ctx, id)
 	return err == nil && ok
 }
-func (b *Bot) Run(ctx context.Context) {
+func (b *Bot) Run(ctx context.Context) error {
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 1
+	consecutiveErrors := 0
 	for {
 		if ctx.Err() != nil {
-			return
+			return nil
 		}
-		updates, err := b.api.GetUpdates(u)
-		if err != nil {
+		if err := b.ensureAPI(); err != nil {
+			consecutiveErrors++
+			if consecutiveErrors >= b.cfg.Monitoring.FailureThreshold {
+				return fmt.Errorf("Telegram polling unavailable after %d initialization errors: %w", consecutiveErrors, err)
+			}
 			select {
 			case <-ctx.Done():
-				return
+				return nil
 			case <-time.After(2 * time.Second):
 				continue
 			}
 		}
+		updates, err := b.apiClient().GetUpdates(u)
+		if err != nil {
+			if isPollingConflict(err) {
+				return fmt.Errorf("Telegram polling conflict: %w", err)
+			}
+			consecutiveErrors++
+			if consecutiveErrors >= b.cfg.Monitoring.FailureThreshold {
+				return fmt.Errorf("Telegram polling unavailable after %d errors: %w", consecutiveErrors, err)
+			}
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(2 * time.Second):
+				continue
+			}
+		}
+		consecutiveErrors = 0
 		for _, update := range updates {
 			if update.UpdateID >= u.Offset {
 				u.Offset = update.UpdateID + 1
 			}
 			if ctx.Err() != nil {
-				return
+				return nil
 			}
 			if update.Message != nil {
 				b.message(ctx, update.Message)
@@ -80,8 +126,21 @@ func (b *Bot) Run(ctx context.Context) {
 		}
 	}
 }
+
+func isPollingConflict(err error) bool {
+	var apiErr *tgbotapi.Error
+	if errors.As(err, &apiErr) && apiErr.Code == 409 {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "conflict") || strings.Contains(message, "409")
+}
 func (b *Bot) message(ctx context.Context, m *tgbotapi.Message) {
 	if !m.IsCommand() {
+		return
+	}
+	api := b.apiClient()
+	if api == nil {
 		return
 	}
 	id := m.From.ID
@@ -115,7 +174,7 @@ func (b *Bot) message(ctx context.Context, m *tgbotapi.Message) {
 	}
 	msg := tgbotapi.NewMessage(m.Chat.ID, "Мониторинг серверов JSOL Team")
 	msg.ReplyMarkup = menu(b.IsAdmin(id))
-	_, _ = b.api.Send(msg)
+	_, _ = api.Send(msg)
 }
 func menu(admin bool) tgbotapi.InlineKeyboardMarkup {
 	rows := [][]tgbotapi.InlineKeyboardButton{{tgbotapi.NewInlineKeyboardButtonData("Серверы", "servers")}, {tgbotapi.NewInlineKeyboardButtonData("Графики", "charts")}}
@@ -129,12 +188,16 @@ func (b *Bot) callback(ctx context.Context, q *tgbotapi.CallbackQuery) {
 	if q == nil {
 		return
 	}
+	api := b.apiClient()
+	if api == nil {
+		return
+	}
 	if !b.allowed(ctx, q.From.ID) {
-		_, _ = b.api.Request(tgbotapi.NewCallback(q.ID, "Доступ закрыт"))
+		_, _ = api.Request(tgbotapi.NewCallback(q.ID, "Доступ закрыт"))
 		return
 	}
 	if q.Message == nil {
-		_, _ = b.api.Request(tgbotapi.NewCallback(q.ID, "Сообщение недоступно"))
+		_, _ = api.Request(tgbotapi.NewCallback(q.ID, "Сообщение недоступно"))
 		return
 	}
 	text := "Неизвестная команда"
@@ -219,11 +282,19 @@ func (b *Bot) callback(ctx context.Context, q *tgbotapi.CallbackQuery) {
 	if len(rows) > 0 {
 		msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
 	}
-	_, _ = b.api.Send(msg)
-	_, _ = b.api.Request(tgbotapi.NewCallback(q.ID, ""))
+	_, _ = api.Send(msg)
+	_, _ = api.Request(tgbotapi.NewCallback(q.ID, ""))
 }
-func (b *Bot) send(chat int64, text string) { _, _ = b.api.Send(tgbotapi.NewMessage(chat, text)) }
+func (b *Bot) send(chat int64, text string) {
+	if api := b.apiClient(); api != nil {
+		_, _ = api.Send(tgbotapi.NewMessage(chat, text))
+	}
+}
 func (b *Bot) Notify(text string) {
+	api := b.apiClient()
+	if api == nil {
+		return
+	}
 	b.notifyMu.Lock()
 	now := time.Now()
 	prefix := ""
@@ -260,7 +331,7 @@ func (b *Bot) Notify(text string) {
 	text = prefix + text
 	b.notifyMu.Unlock()
 	for _, id := range b.cfg.Admins {
-		_, _ = b.api.Send(tgbotapi.NewMessage(id, text))
+		_, _ = api.Send(tgbotapi.NewMessage(id, text))
 	}
 }
 func (b *Bot) RunDailyReports(ctx context.Context, claim func(context.Context, string) (bool, error)) {
@@ -282,7 +353,7 @@ func (b *Bot) RunDailyReports(ctx context.Context, claim func(context.Context, s
 	for {
 		now := time.Now().In(loc)
 		date := now.Format("2006-01-02")
-		if sentDate != date && (now.Hour() > hour || now.Hour() == hour && now.Minute() >= minute) {
+		if b.apiClient() != nil && sentDate != date && (now.Hour() > hour || now.Hour() == hour && now.Minute() >= minute) {
 			ok, e := claim(ctx, date)
 			if e == nil && ok {
 				b.sendDailyReport(ctx, loc)
@@ -299,6 +370,10 @@ func (b *Bot) RunDailyReports(ctx context.Context, claim func(context.Context, s
 	}
 }
 func (b *Bot) sendDailyReport(ctx context.Context, loc *time.Location) {
+	api := b.apiClient()
+	if api == nil {
+		return
+	}
 	var lines []string
 	lines = append(lines, "Сводка за сутки · "+time.Now().In(loc).Format("02.01.2006"))
 	for _, server := range b.cfg.Servers {
@@ -324,7 +399,7 @@ func (b *Bot) sendDailyReport(ctx context.Context, loc *time.Location) {
 		return
 	}
 	for _, id := range ids {
-		if _, err := b.api.Send(tgbotapi.NewMessage(id, text)); err != nil {
+		if _, err := api.Send(tgbotapi.NewMessage(id, text)); err != nil {
 			slog.Warn("ошибка отправки суточной сводки", "user_id", id, "error", err)
 		}
 	}
@@ -341,18 +416,22 @@ func (b *Bot) server(id string) string {
 	if !valid {
 		return "Сервер не найден"
 	}
-	var status, internet, agent string
+	var status, internet, agent, ping string
 	var cpu, ru, rt, du, dt float64
 	var uptime uint64
 	var at time.Time
 	var errText string
-	e := b.store.DB.QueryRow(`SELECT status,internet,agent_status,cpu,ram_used,ram_total,disk_used,disk_total,checked_at,error,uptime FROM samples WHERE server_id=? ORDER BY checked_at DESC LIMIT 1`, id).Scan(&status, &internet, &agent, &cpu, &ru, &rt, &du, &dt, &at, &errText, &uptime)
+	e := b.store.DB.QueryRow(`SELECT status,internet,agent_status,ping_status,cpu,ram_used,ram_total,disk_used,disk_total,checked_at,error,uptime FROM samples WHERE server_id=? ORDER BY checked_at DESC LIMIT 1`, id).Scan(&status, &internet, &agent, &ping, &cpu, &ru, &rt, &du, &dt, &at, &errText, &uptime)
 	if e != nil {
 		return "Нет данных"
 	}
-	return fmt.Sprintf("%s\nСервер: %s\nИнтернет: %s\nАгент: %s\nCPU: %.1f%%\nRAM: %.1f / %.1f GiB\nДиск: %.1f / %.1f GiB\nАптайм: %s\nПроверка: %s\nОшибка: %s", name, status, internet, agent, cpu, ru/1073741824, rt/1073741824, du/1073741824, dt/1073741824, time.Duration(uptime)*time.Second, at.Local().Format("02.01 15:04:05"), errText)
+	return fmt.Sprintf("%s\nСервер: %s\nPing: %s\nИнтернет: %s\nАгент: %s\nCPU: %.1f%%\nRAM: %.1f / %.1f GiB\nДиск: %.1f / %.1f GiB\nАптайм: %s\nПроверка: %s\nОшибка: %s", name, status, ping, internet, agent, cpu, ru/1073741824, rt/1073741824, du/1073741824, dt/1073741824, time.Duration(uptime)*time.Second, at.Local().Format("02.01 15:04:05"), errText)
 }
 func (b *Bot) sendChart(ctx context.Context, chat int64, serverID, hoursText, metric string) {
+	api := b.apiClient()
+	if api == nil {
+		return
+	}
 	validServer := false
 	name := serverID
 	for _, server := range b.cfg.Servers {
@@ -381,7 +460,7 @@ func (b *Bot) sendChart(ctx context.Context, chat int64, serverID, hoursText, me
 	caption := fmt.Sprintf("%s · %s · %s\n%s — %s", name, labels[metric], hoursText+" ч", since.Local().Format("02.01 15:04"), time.Now().Local().Format("02.01 15:04"))
 	photo := tgbotapi.NewPhoto(chat, tgbotapi.FileBytes{Name: "chart.png", Bytes: pngData})
 	photo.Caption = caption
-	if _, err = b.api.Send(photo); err != nil {
+	if _, err = api.Send(photo); err != nil {
 		b.send(chat, "Не удалось отправить график.")
 	}
 }

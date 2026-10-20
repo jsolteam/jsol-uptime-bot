@@ -11,12 +11,13 @@ storage:
   backup_interval: 24h
   backup_retention_days: 14
 coordination:
-  redis_url_env: REDIS_URL
-  lease: 15s
   heartbeat: 5s
 agent:
   listen: :8080
   token_env: AGENT_TOKEN
+  # Перед запуском поместите файлы сертификата и ключа в ./certs/.
+  tls_cert_file: /etc/jsol/certs/fullchain.pem
+  tls_key_file: /etc/jsol/certs/privkey.pem
 monitoring:
   interval: 30s
   timeout: 5s
@@ -27,12 +28,23 @@ monitoring:
   internet_checks:
     - https://example.com
     - https://www.cloudflare.com/cdn-cgi/trace
+    - https://www.google.com/generate_204
 servers:
   - id: node-1
     name: Основной сервер
-    address: 192.168.1.10
+    address: 203.0.113.10
     priority: 1
-    agent_url: http://192.168.1.10:8080
+    agent_url: https://node-1.example.com:8080
+  - id: node-2
+    name: Резервный сервер
+    address: 203.0.113.11
+    priority: 2
+    agent_url: https://node-2.example.com:8080
+  - id: node-3
+    name: Третий сервер
+    address: 203.0.113.12
+    priority: 3
+    agent_url: https://node-3.example.com:8080
 admins:
   - 123456789
 

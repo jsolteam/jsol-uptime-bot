@@ -36,4 +36,5 @@ go.work.sum
 *.db-shm
 *.db-wal
 configs/config.yaml
+certs/
 .cache/

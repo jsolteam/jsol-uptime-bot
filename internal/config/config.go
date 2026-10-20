@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strings"
@@ -27,13 +28,13 @@ type Config struct {
 		BackupRetentionDays int      `yaml:"backup_retention_days"`
 	} `yaml:"storage"`
 	Coordination struct {
-		RedisURLEnv string   `yaml:"redis_url_env"`
-		Lease       Duration `yaml:"lease"`
-		Heartbeat   Duration `yaml:"heartbeat"`
+		Heartbeat Duration `yaml:"heartbeat"`
 	} `yaml:"coordination"`
 	Agent struct {
-		Listen   string `yaml:"listen"`
-		TokenEnv string `yaml:"token_env"`
+		Listen      string `yaml:"listen"`
+		TokenEnv    string `yaml:"token_env"`
+		TLSCertFile string `yaml:"tls_cert_file"`
+		TLSKeyFile  string `yaml:"tls_key_file"`
 	} `yaml:"agent"`
 	Monitoring struct {
 		Interval              Duration `yaml:"interval"`
@@ -83,6 +84,7 @@ func Load(path string) (Config, error) {
 		return c, fmt.Errorf("node.priority не может быть отрицательным")
 	}
 	seen := make(map[string]struct{}, len(c.Servers))
+	selfConfigured := false
 	for _, server := range c.Servers {
 		if server.ID == "" || server.Name == "" || server.Address == "" || server.AgentURL == "" {
 			return c, fmt.Errorf("для каждого сервера обязательны id, name, address и agent_url")
@@ -94,10 +96,27 @@ func Load(path string) (Config, error) {
 			return c, fmt.Errorf("ID сервера повторяется: %s", server.ID)
 		}
 		seen[server.ID] = struct{}{}
+		if server.ID == c.Node.ID {
+			selfConfigured = true
+			if server.Priority != c.Node.Priority {
+				return c, fmt.Errorf("node.priority должен совпадать с priority узла %s в servers", c.Node.ID)
+			}
+		}
 		u, err := url.Parse(server.AgentURL)
 		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
 			return c, fmt.Errorf("некорректный agent_url для %s", server.ID)
 		}
+		ip := net.ParseIP(u.Hostname())
+		loopback := strings.EqualFold(u.Hostname(), "localhost") || ip != nil && ip.IsLoopback()
+		if u.Scheme != "https" && !loopback {
+			return c, fmt.Errorf("для удалённого агента %s требуется HTTPS", server.ID)
+		}
+		if u.Scheme == "https" && c.Agent.TLSCertFile == "" {
+			return c, fmt.Errorf("для HTTPS-агентов задайте agent.tls_cert_file и agent.tls_key_file")
+		}
+	}
+	if !selfConfigured {
+		return c, fmt.Errorf("node.id должен присутствовать в списке servers")
 	}
 	if len(c.Admins) == 0 {
 		return c, fmt.Errorf("задайте хотя бы одного Telegram ID в admins")
@@ -110,6 +129,9 @@ func Load(path string) (Config, error) {
 	}
 	if c.Agent.Listen == "" {
 		c.Agent.Listen = ":8080"
+	}
+	if (c.Agent.TLSCertFile == "") != (c.Agent.TLSKeyFile == "") {
+		return c, fmt.Errorf("agent.tls_cert_file и agent.tls_key_file задаются вместе")
 	}
 	if c.Monitoring.Interval <= 0 {
 		c.Monitoring.Interval = Duration(30 * time.Second)
@@ -126,6 +148,21 @@ func Load(path string) (Config, error) {
 	if c.Monitoring.RetentionDays <= 0 {
 		c.Monitoring.RetentionDays = 30
 	}
+	if len(c.Monitoring.InternetChecks) < 2 {
+		return c, fmt.Errorf("monitoring.internet_checks должен содержать минимум два независимых HTTPS-адреса")
+	}
+	checkHosts := make(map[string]struct{}, len(c.Monitoring.InternetChecks))
+	for _, target := range c.Monitoring.InternetChecks {
+		u, err := url.Parse(target)
+		if err != nil || u.Scheme != "https" || u.Hostname() == "" {
+			return c, fmt.Errorf("проверка интернета должна быть HTTPS URL: %q", target)
+		}
+		host := strings.ToLower(u.Hostname())
+		if _, exists := checkHosts[host]; exists {
+			return c, fmt.Errorf("адреса проверки интернета должны иметь разные хосты: %s", host)
+		}
+		checkHosts[host] = struct{}{}
+	}
 	if c.Storage.BackupDir == "" {
 		c.Storage.BackupDir = c.Storage.SQLitePath + ".backups"
 	}
@@ -134,9 +171,6 @@ func Load(path string) (Config, error) {
 	}
 	if c.Storage.BackupRetentionDays <= 0 {
 		c.Storage.BackupRetentionDays = 14
-	}
-	if c.Coordination.Lease <= 0 {
-		c.Coordination.Lease = Duration(15 * time.Second)
 	}
 	if c.Coordination.Heartbeat <= 0 {
 		c.Coordination.Heartbeat = Duration(5 * time.Second)
