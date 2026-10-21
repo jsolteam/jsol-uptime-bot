@@ -3,7 +3,7 @@ services:
     image: ghcr.io/jsolteam/jsol-uptime-bot:${IMAGE_TAG:-latest}
     build: .
     restart: unless-stopped
-    command: ["/app/uptime-bot", "/etc/jsol/config.yaml"]
+    command: ["/etc/jsol/config.yaml"]
     environment:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?задайте TELEGRAM_BOT_TOKEN}
       AGENT_TOKEN: ${AGENT_TOKEN:?задайте AGENT_TOKEN}
@@ -11,7 +11,7 @@ services:
       - ./configs/config.yaml:/etc/jsol/config.yaml:ro
       - uptime-data:/data
     ports:
-      - "${AGENT_BIND_ADDRESS:-0.0.0.0}:${AGENT_PUBLIC_PORT:-8080}:8080"
+      - "${AGENT_BIND_ADDRESS:-0.0.0.0}:${AGENT_PUBLIC_PORT:-9595}:8080"
     cap_add:
       - NET_RAW
     healthcheck:
