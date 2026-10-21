@@ -153,6 +153,8 @@ func (m *Monitor) Check(ctx context.Context, s config.Server) Probe {
 }
 
 func (m *Monitor) finish(ctx context.Context, p Probe, err error) Probe {
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
 	s := p.Server
 	if err != nil {
 		p.Error = err.Error()
@@ -169,10 +171,10 @@ func (m *Monitor) finish(ctx context.Context, p Probe, err error) Probe {
 	}
 	if p.AgentStatus != "AVAILABLE" && m.cfg.Monitoring.AgentFailureThreshold > 0 && time.Since(m.agentDownSince[s.ID]) >= time.Duration(m.cfg.Monitoring.AgentFailureThreshold) && m.agentStates[s.ID] != "AGENT_UNAVAILABLE" {
 		m.agentStates[s.ID] = "AGENT_UNAVAILABLE"
-		m.event(ctx, s.ID, "agent", "Агент мониторинга недоступен: "+p.Error)
+		m.event(persistCtx, s.ID, "agent", "Агент мониторинга недоступен: "+p.Error)
 	} else if p.AgentStatus == "AVAILABLE" && m.agentStates[s.ID] == "AGENT_UNAVAILABLE" {
 		m.agentStates[s.ID] = "AVAILABLE"
-		m.event(ctx, s.ID, "agent", "Агент мониторинга восстановлен")
+		m.event(persistCtx, s.ID, "agent", "Агент мониторинга восстановлен")
 	}
 	if old := m.states[s.ID]; old != "" && old != p.Status {
 		kind := "status"
@@ -184,7 +186,7 @@ func (m *Monitor) finish(ctx context.Context, p Probe, err error) Probe {
 			kind = "recovery"
 			message = "🟢 Сервер восстановлен: " + s.Name
 		}
-		m.event(ctx, s.ID, kind, message)
+		m.event(persistCtx, s.ID, kind, message)
 	}
 	m.states[s.ID] = p.Status
 	if old := m.internetStates[s.ID]; p.Internet != "UNKNOWN" && old != "" && old != p.Internet {
@@ -194,12 +196,12 @@ func (m *Monitor) finish(ctx context.Context, p Probe, err error) Probe {
 		} else {
 			msg = "✅ Доступ в интернет восстановлен: " + s.Name
 		}
-		m.event(ctx, s.ID, "internet", msg)
+		m.event(persistCtx, s.ID, "internet", msg)
 	}
 	if p.Internet != "UNKNOWN" {
 		m.internetStates[s.ID] = p.Internet
 	}
-	if e := m.store.Save(ctx, storage.Sample{ServerID: s.ID, Status: p.Status, Internet: p.Internet, AgentStatus: p.AgentStatus, PingStatus: p.PingStatus, Error: p.Error, CPU: p.Metrics.CPU, RAMUsed: float64(p.Metrics.RAMUsed), RAMTotal: float64(p.Metrics.RAMTotal), DiskUsed: float64(p.Metrics.DiskUsed), DiskTotal: float64(p.Metrics.DiskTotal), Uptime: p.Metrics.Uptime, CheckedAt: p.CheckedAt}); e != nil {
+	if e := m.store.Save(persistCtx, storage.Sample{ServerID: s.ID, Status: p.Status, Internet: p.Internet, AgentStatus: p.AgentStatus, PingStatus: p.PingStatus, Error: p.Error, CPU: p.Metrics.CPU, RAMUsed: float64(p.Metrics.RAMUsed), RAMTotal: float64(p.Metrics.RAMTotal), DiskUsed: float64(p.Metrics.DiskUsed), DiskTotal: float64(p.Metrics.DiskTotal), Uptime: p.Metrics.Uptime, CheckedAt: p.CheckedAt}); e != nil {
 		slog.Error("не удалось сохранить измерение", "server", s.ID, "error", e)
 	}
 	return p
