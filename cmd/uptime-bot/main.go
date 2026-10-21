@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"log/slog"
 	"net"
@@ -42,12 +41,6 @@ func main() {
 		slog.Error("не удалось открыть порт агента", "error", err)
 		os.Exit(1)
 	}
-	if cfg.Agent.TLSCertFile != "" {
-		if _, err = tls.LoadX509KeyPair(cfg.Agent.TLSCertFile, cfg.Agent.TLSKeyFile); err != nil {
-			slog.Error("сертификат TLS агента", "error", err)
-			os.Exit(1)
-		}
-	}
 	var nodeStatus atomic.Value
 	var leaderActive atomic.Bool
 	var pollingActive atomic.Bool
@@ -60,11 +53,7 @@ func main() {
 	}), ReadHeaderTimeout: 3 * time.Second}
 	go func() {
 		var e error
-		if cfg.Agent.TLSCertFile != "" {
-			e = agentServer.ServeTLS(listener, cfg.Agent.TLSCertFile, cfg.Agent.TLSKeyFile)
-		} else {
-			e = agentServer.Serve(listener)
-		}
+		e = agentServer.Serve(listener)
 		if e != nil && !errors.Is(e, http.ErrServerClosed) {
 			slog.Error("агент", "error", e)
 		}

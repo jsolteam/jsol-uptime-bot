@@ -2,7 +2,6 @@ package config
 
 import (
 	"fmt"
-	"net"
 	"net/url"
 	"os"
 	"strings"
@@ -31,10 +30,8 @@ type Config struct {
 		Heartbeat Duration `yaml:"heartbeat"`
 	} `yaml:"coordination"`
 	Agent struct {
-		Listen      string `yaml:"listen"`
-		TokenEnv    string `yaml:"token_env"`
-		TLSCertFile string `yaml:"tls_cert_file"`
-		TLSKeyFile  string `yaml:"tls_key_file"`
+		Listen   string `yaml:"listen"`
+		TokenEnv string `yaml:"token_env"`
 	} `yaml:"agent"`
 	Monitoring struct {
 		Interval              Duration `yaml:"interval"`
@@ -103,16 +100,8 @@ func Load(path string) (Config, error) {
 			}
 		}
 		u, err := url.Parse(server.AgentURL)
-		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		if err != nil || u.Host == "" || u.Scheme != "http" {
 			return c, fmt.Errorf("некорректный agent_url для %s", server.ID)
-		}
-		ip := net.ParseIP(u.Hostname())
-		loopback := strings.EqualFold(u.Hostname(), "localhost") || ip != nil && ip.IsLoopback()
-		if u.Scheme != "https" && !loopback {
-			return c, fmt.Errorf("для удалённого агента %s требуется HTTPS", server.ID)
-		}
-		if u.Scheme == "https" && c.Agent.TLSCertFile == "" {
-			return c, fmt.Errorf("для HTTPS-агентов задайте agent.tls_cert_file и agent.tls_key_file")
 		}
 	}
 	if !selfConfigured {
@@ -129,9 +118,6 @@ func Load(path string) (Config, error) {
 	}
 	if c.Agent.Listen == "" {
 		c.Agent.Listen = ":8080"
-	}
-	if (c.Agent.TLSCertFile == "") != (c.Agent.TLSKeyFile == "") {
-		return c, fmt.Errorf("agent.tls_cert_file и agent.tls_key_file задаются вместе")
 	}
 	if c.Monitoring.Interval <= 0 {
 		c.Monitoring.Interval = Duration(30 * time.Second)
