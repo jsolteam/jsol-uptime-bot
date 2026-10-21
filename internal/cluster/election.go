@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -100,6 +101,9 @@ func (e *Elector) Leader(ctx context.Context, local agent.NodeStatus) (string, b
 	}
 	responses := make(chan response, len(e.config.Servers))
 	requests := 0
+	if local.NodeID == e.config.Node.ID && local.CheckedAt.IsZero() {
+		return "", false, fmt.Errorf("локальное состояние узла ещё не готово")
+	}
 	maxAge := 3 * time.Duration(e.config.Coordination.Heartbeat)
 	probeCycle := 2*time.Duration(e.config.Monitoring.Timeout) + time.Duration(e.config.Coordination.Heartbeat)
 	if probeCycle > maxAge {
@@ -107,7 +111,9 @@ func (e *Elector) Leader(ctx context.Context, local agent.NodeStatus) (string, b
 	}
 	for _, server := range e.config.Servers {
 		if server.ID == e.config.Node.ID {
-			responses <- response{server: server, status: local, ok: true}
+			if time.Since(local.CheckedAt) <= maxAge {
+				reachable = append(reachable, candidate{id: server.ID, priority: server.Priority, ready: local.Ready, polling: local.Polling})
+			}
 			continue
 		}
 		requests++
@@ -133,10 +139,8 @@ func (e *Elector) Leader(ctx context.Context, local agent.NodeStatus) (string, b
 			responses <- response{server: server, status: status, ok: true}
 		}(server)
 	}
-	if local.NodeID == e.config.Node.ID && local.CheckedAt.IsZero() {
-		return "", false, fmt.Errorf("локальное состояние узла ещё не готово")
-	}
-	for i := 0; i < requests+1; i++ {
+collect:
+	for i := 0; i < requests; i++ {
 		select {
 		case result := <-responses:
 			if !result.ok {
@@ -148,12 +152,11 @@ func (e *Elector) Leader(ctx context.Context, local agent.NodeStatus) (string, b
 			}
 			reachable = append(reachable, candidate{id: result.server.ID, priority: result.server.Priority, ready: status.Ready, polling: status.Polling})
 		case <-ctx.Done():
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				break collect
+			}
 			return "", false, ctx.Err()
 		}
-	}
-	quorum := len(e.config.Servers)/2 + 1
-	if len(reachable) < quorum {
-		return "", false, nil
 	}
 	var eligible []candidate
 	for _, node := range reachable {
@@ -185,7 +188,7 @@ func (e *Elector) Describe(ctx context.Context, local agent.NodeStatus) string {
 		return fmt.Sprintf("ошибка выбора ведущего: %v", err)
 	}
 	if leader == "" {
-		return "нет кворума доступных узлов"
+		return "нет доступных узлов, готовых стать ведущими"
 	}
 	if active {
 		return "узел выбран ведущим"

@@ -31,17 +31,17 @@ servers:
     name: Основной сервер
     address: 203.0.113.10
     priority: 1
-    agent_url: http://203.0.113.10:8080
+    agent_url: http://203.0.113.10:9595
   - id: node-2
     name: Резервный сервер
     address: 203.0.113.11
     priority: 2
-    agent_url: http://203.0.113.11:8080
+    agent_url: http://203.0.113.11:9595
   - id: node-3
     name: Третий сервер
     address: 203.0.113.12
     priority: 3
-    agent_url: http://203.0.113.12:8080
+    agent_url: http://203.0.113.12:9595
 admins:
   - 123456789
 
