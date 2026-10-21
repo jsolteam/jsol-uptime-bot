@@ -148,7 +148,7 @@ func (b *Bot) message(ctx context.Context, m *tgbotapi.Message) {
 		if m.Command() == "start" {
 			accepted, err := b.store.AcceptInvite(ctx, id, m.From.UserName)
 			if err == nil && accepted {
-				b.send(m.Chat.ID, "Доступ выдан. Откройте /start ещё раз.")
+				b.sendMenu(m.Chat.ID, "✅ Доступ выдан. Выберите раздел мониторинга.")
 				return
 			}
 		}
@@ -162,28 +162,38 @@ func (b *Bot) message(ctx context.Context, m *tgbotapi.Message) {
 		}
 		args := strings.Fields(m.CommandArguments())
 		if len(args) != 1 {
-			b.send(m.Chat.ID, "Использование: /invite @username")
+			b.sendMenu(m.Chat.ID, "Использование: /invite @username")
 			return
 		}
 		if err := b.store.Invite(ctx, args[0], id); err != nil {
-			b.send(m.Chat.ID, "Не удалось создать приглашение: "+err.Error())
+			b.sendMenu(m.Chat.ID, "Не удалось создать приглашение: "+err.Error())
 			return
 		}
-		b.send(m.Chat.ID, "Приглашение создано. Пользователь должен открыть бота через /start.")
+		b.sendMenu(m.Chat.ID, "✅ Приглашение создано. Пользователь должен открыть бота через /start.")
 		return
 	}
-	msg := tgbotapi.NewMessage(m.Chat.ID, "Мониторинг серверов JSOL Team")
+	msg := tgbotapi.NewMessage(m.Chat.ID, "📡 JSOL Uptime\n\nВыберите раздел мониторинга.")
 	msg.ReplyMarkup = menu(b.IsAdmin(id))
 	_, _ = api.Send(msg)
 }
 func menu(admin bool) tgbotapi.InlineKeyboardMarkup {
-	rows := [][]tgbotapi.InlineKeyboardButton{{tgbotapi.NewInlineKeyboardButtonData("Серверы", "servers")}, {tgbotapi.NewInlineKeyboardButtonData("Графики", "charts")}}
-	if admin {
-		rows = append(rows, []tgbotapi.InlineKeyboardButton{tgbotapi.NewInlineKeyboardButtonData("Пользователи", "users")})
+	rows := [][]tgbotapi.InlineKeyboardButton{
+		{tgbotapi.NewInlineKeyboardButtonData("🖥 Серверы", "servers"), tgbotapi.NewInlineKeyboardButtonData("📈 Графики", "charts")},
+		{tgbotapi.NewInlineKeyboardButtonData("📋 Журнал событий", "events"), tgbotapi.NewInlineKeyboardButtonData("🗓 Сводка за сутки", "summary")},
 	}
-	rows = append(rows, []tgbotapi.InlineKeyboardButton{tgbotapi.NewInlineKeyboardButtonData("Журнал событий", "events")}, []tgbotapi.InlineKeyboardButton{tgbotapi.NewInlineKeyboardButtonData("Сводка за сутки", "summary")})
+	if admin {
+		rows = append(rows, []tgbotapi.InlineKeyboardButton{tgbotapi.NewInlineKeyboardButtonData("👥 Пользователи", "users")})
+	}
 	return tgbotapi.NewInlineKeyboardMarkup(rows...)
 }
+
+func navigation(back string) []tgbotapi.InlineKeyboardButton {
+	return []tgbotapi.InlineKeyboardButton{
+		tgbotapi.NewInlineKeyboardButtonData("⬅️ Назад", back),
+		tgbotapi.NewInlineKeyboardButtonData("🏠 В меню", "menu"),
+	}
+}
+
 func (b *Bot) callback(ctx context.Context, q *tgbotapi.CallbackQuery) {
 	if q == nil {
 		return
@@ -200,57 +210,72 @@ func (b *Bot) callback(ctx context.Context, q *tgbotapi.CallbackQuery) {
 		_, _ = api.Request(tgbotapi.NewCallback(q.ID, "Сообщение недоступно"))
 		return
 	}
-	text := "Неизвестная команда"
+	_, _ = api.Request(tgbotapi.NewCallback(q.ID, ""))
+	text := "Неизвестная команда. Откройте меню."
 	rows := [][]tgbotapi.InlineKeyboardButton{}
 	switch q.Data {
+	case "menu":
+		text = "📡 JSOL Uptime\n\nВыберите раздел мониторинга."
+		rows = menu(b.IsAdmin(q.From.ID)).InlineKeyboard
 	case "servers":
-		text = "Серверы:"
+		text = "🖥 Серверы\nВыберите узел, чтобы открыть подробную карточку."
 		for _, s := range b.cfg.Servers {
 			rows = append(rows, []tgbotapi.InlineKeyboardButton{tgbotapi.NewInlineKeyboardButtonData(b.serverLabel(s), "server:"+s.ID)})
 		}
+		rows = append(rows, navigation("menu"))
 	case "charts":
-		text = "Выберите сервер:"
+		text = "📈 Графики\n\nВыберите сервер."
 		for _, s := range b.cfg.Servers {
-			rows = append(rows, []tgbotapi.InlineKeyboardButton{tgbotapi.NewInlineKeyboardButtonData(s.Name, "chartmenu:"+s.ID)})
+			rows = append(rows, []tgbotapi.InlineKeyboardButton{tgbotapi.NewInlineKeyboardButtonData(b.serverLabel(s), "chartmenu:"+s.ID)})
 		}
+		rows = append(rows, navigation("menu"))
 	case "events":
 		text = b.events()
+		rows = append(rows, navigation("menu"))
 	case "summary":
 		text = b.summary()
+		rows = append(rows, navigation("menu"))
 	case "users":
 		if !b.IsAdmin(q.From.ID) {
 			text = "Недостаточно прав."
 		} else {
 			text, rows = b.users(ctx)
+			rows = append(rows, navigation("menu"))
 		}
 	default:
 		if strings.HasPrefix(q.Data, "server:") {
 			id := strings.TrimPrefix(q.Data, "server:")
 			text = b.server(id)
-			rows = append(rows, []tgbotapi.InlineKeyboardButton{tgbotapi.NewInlineKeyboardButtonData("Обновить", "server:"+id), tgbotapi.NewInlineKeyboardButtonData("Графики", "chartmenu:"+id)}, []tgbotapi.InlineKeyboardButton{tgbotapi.NewInlineKeyboardButtonData("К списку", "servers")})
-		}
-		if strings.HasPrefix(q.Data, "chartmenu:") {
+			rows = append(rows,
+				[]tgbotapi.InlineKeyboardButton{tgbotapi.NewInlineKeyboardButtonData("🔄 Обновить", "server:"+id), tgbotapi.NewInlineKeyboardButtonData("📈 Графики", "chartmenu:"+id)},
+				navigation("servers"),
+			)
+		} else if strings.HasPrefix(q.Data, "chartmenu:") {
 			id := strings.TrimPrefix(q.Data, "chartmenu:")
-			text = "Выберите период:"
-			rows = [][]tgbotapi.InlineKeyboardButton{{tgbotapi.NewInlineKeyboardButtonData("1 час", "chartperiod:"+id+":1")}, {tgbotapi.NewInlineKeyboardButtonData("6 часов", "chartperiod:"+id+":6")}, {tgbotapi.NewInlineKeyboardButtonData("24 часа", "chartperiod:"+id+":24")}, {tgbotapi.NewInlineKeyboardButtonData("7 дней", "chartperiod:"+id+":168")}}
-		}
-		if strings.HasPrefix(q.Data, "chartperiod:") {
+			text = "📈 " + b.serverName(id) + "\n\nВыберите период:"
+			rows = [][]tgbotapi.InlineKeyboardButton{
+				{tgbotapi.NewInlineKeyboardButtonData("1 час", "chartperiod:"+id+":1"), tgbotapi.NewInlineKeyboardButtonData("6 часов", "chartperiod:"+id+":6")},
+				{tgbotapi.NewInlineKeyboardButtonData("24 часа", "chartperiod:"+id+":24"), tgbotapi.NewInlineKeyboardButtonData("7 дней", "chartperiod:"+id+":168")},
+				navigation("charts"),
+			}
+		} else if strings.HasPrefix(q.Data, "chartperiod:") {
 			parts := strings.Split(q.Data, ":")
 			if len(parts) == 3 {
-				text = "Выберите показатель:"
-				for _, metric := range []struct{ label, key string }{{"CPU", "cpu"}, {"RAM", "ram"}, {"Доступность", "availability"}} {
-					rows = append(rows, []tgbotapi.InlineKeyboardButton{tgbotapi.NewInlineKeyboardButtonData(metric.label, "chart:"+parts[1]+":"+parts[2]+":"+metric.key)})
+				text = "📊 " + b.serverName(parts[1]) + "\nПериод: " + periodLabel(parts[2]) + "\n\nВыберите показатель:"
+				rows = [][]tgbotapi.InlineKeyboardButton{
+					{tgbotapi.NewInlineKeyboardButtonData("CPU", "chart:"+parts[1]+":"+parts[2]+":cpu"), tgbotapi.NewInlineKeyboardButtonData("RAM", "chart:"+parts[1]+":"+parts[2]+":ram")},
+					{tgbotapi.NewInlineKeyboardButtonData("Доступность", "chart:"+parts[1]+":"+parts[2]+":availability")},
+					navigation("chartmenu:" + parts[1]),
 				}
 			}
-		}
-		if strings.HasPrefix(q.Data, "chart:") {
+		} else if strings.HasPrefix(q.Data, "chart:") {
 			parts := strings.Split(q.Data, ":")
 			if len(parts) == 4 {
 				b.sendChart(ctx, q.Message.Chat.ID, parts[1], parts[2], parts[3])
-				text = "График отправлен."
+				text = "📈 График отправлен\n" + b.serverName(parts[1]) + " · " + periodLabel(parts[2])
+				rows = [][]tgbotapi.InlineKeyboardButton{navigation("chartperiod:" + parts[1] + ":" + parts[2])}
 			}
-		}
-		if strings.HasPrefix(q.Data, "disable:") {
+		} else if strings.HasPrefix(q.Data, "disable:") {
 			if !b.IsAdmin(q.From.ID) {
 				text = "Недостаточно прав."
 			} else {
@@ -258,12 +283,14 @@ func (b *Bot) callback(ctx context.Context, q *tgbotapi.CallbackQuery) {
 				if e != nil {
 					text = "Некорректный ID"
 				} else {
-					rows = append(rows, []tgbotapi.InlineKeyboardButton{tgbotapi.NewInlineKeyboardButtonData("Подтвердить отключение", "confirm-disable:"+strconv.FormatInt(n, 10)), tgbotapi.NewInlineKeyboardButtonData("Отмена", "users")})
-					text = fmt.Sprintf("Отключить доступ пользователя %d?", n)
+					rows = [][]tgbotapi.InlineKeyboardButton{
+						{tgbotapi.NewInlineKeyboardButtonData("Отключить доступ", "confirm-disable:"+strconv.FormatInt(n, 10))},
+						navigation("users"),
+					}
+					text = fmt.Sprintf("⚠️ Отключить доступ пользователя %d?", n)
 				}
 			}
-		}
-		if strings.HasPrefix(q.Data, "confirm-disable:") {
+		} else if strings.HasPrefix(q.Data, "confirm-disable:") {
 			if !b.IsAdmin(q.From.ID) {
 				text = "Недостаточно прав."
 			} else {
@@ -273,21 +300,111 @@ func (b *Bot) callback(ctx context.Context, q *tgbotapi.CallbackQuery) {
 				} else if e = b.store.DisableUser(ctx, n); e != nil {
 					text = "Не удалось изменить доступ"
 				} else {
-					text = "Доступ отключён."
+					text = "✅ Доступ отключён."
+					rows = append(rows, navigation("users"))
 				}
 			}
 		}
 	}
-	msg := tgbotapi.NewMessage(q.Message.Chat.ID, text)
-	if len(rows) > 0 {
-		msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
+	b.editScreen(api, q.Message, text, rows)
+}
+
+func (b *Bot) editScreen(api *tgbotapi.BotAPI, message *tgbotapi.Message, text string, rows [][]tgbotapi.InlineKeyboardButton) {
+	markup := tgbotapi.NewInlineKeyboardMarkup(rows...)
+	var edit tgbotapi.Chattable
+	if len(message.Photo) > 0 {
+		config := tgbotapi.NewEditMessageCaption(message.Chat.ID, message.MessageID, text)
+		config.ReplyMarkup = &markup
+		edit = config
+	} else {
+		edit = tgbotapi.NewEditMessageTextAndMarkup(message.Chat.ID, message.MessageID, text, markup)
 	}
-	_, _ = api.Send(msg)
-	_, _ = api.Request(tgbotapi.NewCallback(q.ID, ""))
+	if _, err := api.Send(edit); err != nil && !strings.Contains(err.Error(), "message is not modified") {
+		fallback := tgbotapi.NewMessage(message.Chat.ID, text)
+		fallback.ReplyMarkup = markup
+		if _, sendErr := api.Send(fallback); sendErr != nil {
+			slog.Warn("не удалось обновить экран бота", "error", sendErr)
+		}
+	}
+}
+
+func periodLabel(value string) string {
+	labels := map[string]string{"1": "1 час", "6": "6 часов", "24": "24 часа", "168": "7 дней"}
+	if label, ok := labels[value]; ok {
+		return label
+	}
+	return value + " ч"
+}
+
+func serverStatus(status string) string {
+	switch status {
+	case "UP":
+		return "🟢 Доступен"
+	case "DOWN":
+		return "🔴 Недоступен"
+	default:
+		return "⚪ Неизвестно"
+	}
+}
+
+func internetStatus(status string) string {
+	switch status {
+	case "INTERNET_OK":
+		return "🟢 Есть доступ"
+	case "NO_INTERNET":
+		return "🔴 Нет доступа"
+	default:
+		return "⚪ Неизвестно"
+	}
+}
+
+func agentStatus(status string) string {
+	switch status {
+	case "AVAILABLE":
+		return "🟢 Работает"
+	case "AGENT_UNAVAILABLE":
+		return "🔴 Нет ответа"
+	default:
+		return "⚪ Неизвестно"
+	}
+}
+
+func pingStatus(status string) string {
+	switch status {
+	case "LOCAL":
+		return "локальный узел"
+	case "REACHABLE":
+		return "🟢 отвечает"
+	case "NO_REPLY":
+		return "🔴 нет ответа"
+	default:
+		return "⚪ неизвестно"
+	}
+}
+
+func uptimeLabel(seconds uint64) string {
+	days := seconds / 86400
+	hours := seconds % 86400 / 3600
+	minutes := seconds % 3600 / 60
+	if days > 0 {
+		return fmt.Sprintf("%d д %d ч", days, hours)
+	}
+	if hours > 0 {
+		return fmt.Sprintf("%d ч %d мин", hours, minutes)
+	}
+	return fmt.Sprintf("%d мин", minutes)
 }
 func (b *Bot) send(chat int64, text string) {
 	if api := b.apiClient(); api != nil {
 		_, _ = api.Send(tgbotapi.NewMessage(chat, text))
+	}
+}
+
+func (b *Bot) sendMenu(chat int64, text string) {
+	if api := b.apiClient(); api != nil {
+		message := tgbotapi.NewMessage(chat, text)
+		message.ReplyMarkup = menu(b.IsAdmin(chat))
+		_, _ = api.Send(message)
 	}
 }
 func (b *Bot) Notify(text string) {
@@ -331,7 +448,11 @@ func (b *Bot) Notify(text string) {
 	text = prefix + text
 	b.notifyMu.Unlock()
 	for _, id := range b.cfg.Admins {
-		_, _ = api.Send(tgbotapi.NewMessage(id, text))
+		message := tgbotapi.NewMessage(id, text)
+		message.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup([]tgbotapi.InlineKeyboardButton{
+			tgbotapi.NewInlineKeyboardButtonData("📡 Открыть меню", "menu"),
+		})
+		_, _ = api.Send(message)
 	}
 }
 func (b *Bot) RunDailyReports(ctx context.Context, claim func(context.Context, string) (bool, error)) {
@@ -375,7 +496,7 @@ func (b *Bot) sendDailyReport(ctx context.Context, loc *time.Location) {
 		return
 	}
 	var lines []string
-	lines = append(lines, "Сводка за сутки · "+time.Now().In(loc).Format("02.01.2006"))
+	lines = append(lines, "🗓 Сводка за сутки · "+time.Now().In(loc).Format("02.01.2006"))
 	for _, server := range b.cfg.Servers {
 		var status, internet string
 		var cpu, ram, total float64
@@ -390,7 +511,7 @@ func (b *Bot) sendDailyReport(ctx context.Context, loc *time.Location) {
 		}
 		var incidents int
 		_ = b.store.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE server_id=? AND occurred_at>=? AND kind IN ('down','recovery','internet','agent')`, server.ID, time.Now().Add(-24*time.Hour)).Scan(&incidents)
-		lines = append(lines, fmt.Sprintf("%s: %s, интернет %s, CPU %.1f%%, RAM %.1f%%, событий %d", server.Name, status, internet, cpu, ramPercent, incidents))
+		lines = append(lines, fmt.Sprintf("🖥 %s\nДоступность: %s · Интернет: %s\nCPU %.1f%% · RAM %.1f%% · событий %d", server.Name, serverStatus(status), internetStatus(internet), cpu, ramPercent, incidents))
 	}
 	text := strings.Join(lines, "\n")
 	ids, err := b.store.UserIDs(ctx)
@@ -399,7 +520,9 @@ func (b *Bot) sendDailyReport(ctx context.Context, loc *time.Location) {
 		return
 	}
 	for _, id := range ids {
-		if _, err := api.Send(tgbotapi.NewMessage(id, text)); err != nil {
+		message := tgbotapi.NewMessage(id, text)
+		message.ReplyMarkup = menu(b.IsAdmin(id))
+		if _, err := api.Send(message); err != nil {
 			slog.Warn("ошибка отправки суточной сводки", "user_id", id, "error", err)
 		}
 	}
@@ -423,9 +546,24 @@ func (b *Bot) server(id string) string {
 	var errText string
 	e := b.store.DB.QueryRow(`SELECT status,internet,agent_status,ping_status,cpu,ram_used,ram_total,disk_used,disk_total,checked_at,error,uptime FROM samples WHERE server_id=? ORDER BY checked_at DESC LIMIT 1`, id).Scan(&status, &internet, &agent, &ping, &cpu, &ru, &rt, &du, &dt, &at, &errText, &uptime)
 	if e != nil {
-		return "Нет данных"
+		return "🖥 " + name + "\n\nПока нет измерений."
 	}
-	return fmt.Sprintf("%s\nСервер: %s\nPing: %s\nИнтернет: %s\nАгент: %s\nCPU: %.1f%%\nRAM: %.1f / %.1f GiB\nДиск: %.1f / %.1f GiB\nАптайм: %s\nПроверка: %s\nОшибка: %s", name, status, ping, internet, agent, cpu, ru/1073741824, rt/1073741824, du/1073741824, dt/1073741824, time.Duration(uptime)*time.Second, at.Local().Format("02.01 15:04:05"), errText)
+	var details strings.Builder
+	fmt.Fprintf(&details, "🖥 %s\n\nДоступность: %s\nПинг: %s\nИнтернет: %s\nАгент: %s\n", name, serverStatus(status), pingStatus(ping), internetStatus(internet), agentStatus(agent))
+	if agent == "AVAILABLE" {
+		fmt.Fprintf(&details, "\nCPU: %.1f%%\nRAM: %.2f / %.2f GiB (свободно %.2f GiB)\nДиск: %.2f / %.2f GiB (свободно %.2f GiB)\nАптайм: %s\n", cpu, ru/1073741824, rt/1073741824, max(0, rt-ru)/1073741824, du/1073741824, dt/1073741824, max(0, dt-du)/1073741824, uptimeLabel(uptime))
+	} else {
+		details.WriteString("\nМетрики: агент не передал данные\n")
+	}
+	fmt.Fprintf(&details, "\nПоследняя проверка: %s", at.Local().Format("02.01.2006 · 15:04:05"))
+	if strings.TrimSpace(errText) != "" {
+		errorText := strings.TrimSpace(errText)
+		if len([]rune(errorText)) > 240 {
+			errorText = string([]rune(errorText)[:240]) + "…"
+		}
+		fmt.Fprintf(&details, "\n\nПоследняя ошибка:\n%s", errorText)
+	}
+	return details.String()
 }
 func (b *Bot) sendChart(ctx context.Context, chat int64, serverID, hoursText, metric string) {
 	api := b.apiClient()
@@ -442,26 +580,30 @@ func (b *Bot) sendChart(ctx context.Context, chat int64, serverID, hoursText, me
 	}
 	hours, err := strconv.Atoi(hoursText)
 	if !validServer || err != nil || (hours != 1 && hours != 6 && hours != 24 && hours != 168) || (metric != "cpu" && metric != "ram" && metric != "availability") {
-		b.send(chat, "Некорректные параметры графика.")
+		b.sendMenu(chat, "Некорректные параметры графика.")
 		return
 	}
 	since := time.Now().Add(-time.Duration(hours) * time.Hour)
 	samples, err := b.store.Samples(ctx, serverID, since, 300)
 	if err != nil {
-		b.send(chat, "Не удалось прочитать историю измерений.")
+		b.sendMenu(chat, "Не удалось прочитать историю измерений.")
 		return
 	}
 	pngData, err := charts.Render(metric, samples)
 	if err != nil {
-		b.send(chat, "За выбранный период пока нет данных.")
+		b.sendMenu(chat, "За выбранный период пока нет данных.")
 		return
 	}
 	labels := map[string]string{"cpu": "CPU, %", "ram": "RAM, %", "availability": "Доступность, %"}
-	caption := fmt.Sprintf("%s · %s · %s\n%s — %s", name, labels[metric], hoursText+" ч", since.Local().Format("02.01 15:04"), time.Now().Local().Format("02.01 15:04"))
+	caption := fmt.Sprintf("📈 %s\n%s · %s\n%s — %s", name, labels[metric], periodLabel(hoursText), since.Local().Format("02.01 15:04"), time.Now().Local().Format("02.01 15:04"))
 	photo := tgbotapi.NewPhoto(chat, tgbotapi.FileBytes{Name: "chart.png", Bytes: pngData})
 	photo.Caption = caption
+	photo.ReplyMarkup = &tgbotapi.InlineKeyboardMarkup{InlineKeyboard: [][]tgbotapi.InlineKeyboardButton{
+		{tgbotapi.NewInlineKeyboardButtonData("🔄 Другой график", "chartmenu:"+serverID)},
+		navigation("chartperiod:" + serverID + ":" + hoursText),
+	}}
 	if _, err = api.Send(photo); err != nil {
-		b.send(chat, "Не удалось отправить график.")
+		b.sendMenu(chat, "Не удалось отправить график.")
 	}
 }
 func (b *Bot) events() string {
@@ -470,23 +612,37 @@ func (b *Bot) events() string {
 		return "Не удалось прочитать журнал"
 	}
 	defer rows.Close()
-	var out []string
+	out := []string{"📋 Журнал событий", "Последние события:"}
 	for rows.Next() {
 		var t time.Time
 		var id, k, m string
 		if rows.Scan(&t, &id, &k, &m) == nil {
-			out = append(out, fmt.Sprintf("%s %s %s: %s", t.Local().Format("02.01 15:04"), id, k, m))
+			icon := "ℹ️"
+			switch k {
+			case "down":
+				icon = "🔴"
+			case "recovery":
+				icon = "🟢"
+			case "internet", "agent":
+				icon = "⚠️"
+			case "leader":
+				icon = "👑"
+			}
+			if id != "" {
+				id = b.serverName(id)
+			}
+			out = append(out, fmt.Sprintf("%s %s · %s\n%s", icon, t.Local().Format("02.01 15:04"), id, m))
 		}
 	}
-	if len(out) == 0 {
-		return "Событий пока нет"
+	if len(out) == 2 {
+		return "📋 Журнал событий\n\nСобытий пока нет."
 	}
 	return strings.Join(out, "\n")
 }
 func (b *Bot) summary() string {
 	var total, down int
 	_ = b.store.DB.QueryRow(`SELECT COUNT(*),COALESCE(SUM(status='DOWN'),0) FROM (SELECT server_id,status,MAX(checked_at) FROM samples GROUP BY server_id)`).Scan(&total, &down)
-	return fmt.Sprintf("Последнее состояние: серверов %d, недоступны %d", total, down)
+	return fmt.Sprintf("🗓 Сводка за сутки\n\nУзлов с данными: %d из %d\nНедоступны: %d\n\nПодробные показатели доступны в карточках серверов.", total, len(b.cfg.Servers), down)
 }
 func (b *Bot) users(ctx context.Context) (string, [][]tgbotapi.InlineKeyboardButton) {
 	users, e := b.store.Users(ctx)
@@ -511,5 +667,21 @@ func (b *Bot) serverLabel(server config.Server) string {
 	if err := b.store.DB.QueryRow(`SELECT status FROM samples WHERE server_id=? ORDER BY checked_at DESC LIMIT 1`, server.ID).Scan(&status); err != nil {
 		status = "UNKNOWN"
 	}
-	return fmt.Sprintf("%s · %s · приоритет %d", server.Name, status, server.Priority)
+	icon := "⚪"
+	switch status {
+	case "UP":
+		icon = "🟢"
+	case "DOWN":
+		icon = "🔴"
+	}
+	return fmt.Sprintf("%s %s · приоритет %d", icon, server.Name, server.Priority)
+}
+
+func (b *Bot) serverName(id string) string {
+	for _, server := range b.cfg.Servers {
+		if server.ID == id {
+			return server.Name
+		}
+	}
+	return id
 }
